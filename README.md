@@ -44,7 +44,7 @@ unzip /path/to/all_data.zip -d datasets/
 
 These datasets have been preprocessed and are ready for use.
 
-# Train CASTNet
+# Train STCANet
 ```bash
 python experiments/train.py --cfg CASTNet/${DATASET_NAME}.py --gpus '0'
 ```
