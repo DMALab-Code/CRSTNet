@@ -1,5 +1,5 @@
-# CASTNet
-This is an implementation of "CASTNet: Computationally-Efficient Adaptive Spatio-Temporal Network for Urban Traffic Prediction".
+# STCANet
+This is an implementation of "STCANet: Adaptive Spatio-Temporal Network with Cluster Attention for Traffic Prediction".
 
 # Table of Contents
 
