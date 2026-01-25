@@ -12,9 +12,9 @@ experiments  --> Training scripts.
 
 scripts   --> Data preprocessing scripts.
 
-CASTNet/arch      --> The implementation of CASTNet.
+STCANet/arch      --> The implementation of STCANet.
 
-CASTNet/${DATASET_NAME}.py    --> Training configs.
+STCANet/${DATASET_NAME}.py    --> Training configs.
 ```
 
 Replace `${DATASET_NAME}` with one of  `PEMS04`,  `PEMS08`, `METR-LA`, `PEMS-BAY`, or any other dataset you want to use.
@@ -46,7 +46,7 @@ These datasets have been preprocessed and are ready for use.
 
 # Train STCANet
 ```bash
-python experiments/train.py --cfg CASTNet/${DATASET_NAME}.py --gpus '0'
+python experiments/train.py --cfg STCANet/${DATASET_NAME}.py --gpus '0'
 ```
 
 Replace `${DATASET_NAME}` with one of  `PEMS04`,  `PEMS08`, `METR-LA`, `PEMS-BAY`, or any other dataset you want to use.
