@@ -1,10 +1,10 @@
-# STCANet
-This is an implementation of "STCANet: Adaptive Spatio-Temporal Network with Cluster Attention for Traffic Prediction".
+# CRSTNet
+This is an implementation of "CRSTNet: Dynamic Cluster Routing for Adaptive Spatio-Temporal Traffic Prediction".
 
 # Table of Contents
 
 ```text
-basicts   --> The BasicTS, which provides standard pipelines for training MTS forecasting models. Don't worry if you don't know it, because it doesn't prevent you from understanding CASTNet's code.
+basicts   --> The BasicTS, which provides standard pipelines for training MTS forecasting models. Don't worry if you don't know it, because it doesn't prevent you from understanding CRSTNet's code.
 
 datasets  --> Raw datasets and preprocessed data
 
@@ -12,9 +12,9 @@ experiments  --> Training scripts.
 
 scripts   --> Data preprocessing scripts.
 
-STCANet/arch      --> The implementation of STCANet.
+CRSTNet/arch      --> The implementation of CRSTNet.
 
-STCANet/${DATASET_NAME}.py    --> Training configs.
+CRSTNet/${DATASET_NAME}.py    --> Training configs.
 ```
 
 Replace `${DATASET_NAME}` with one of  `PEMS04`,  `PEMS08`, `METR-LA`, `PEMS-BAY`, or any other dataset you want to use.
@@ -44,9 +44,9 @@ unzip /path/to/all_data.zip -d datasets/
 
 These datasets have been preprocessed and are ready for use.
 
-# Train STCANet
+# Train CRSTNet
 ```bash
-python experiments/train.py --cfg STCANet/${DATASET_NAME}.py --gpus '0'
+python experiments/train.py --cfg CRSTNet/${DATASET_NAME}.py --gpus '0'
 ```
 
 Replace `${DATASET_NAME}` with one of  `PEMS04`,  `PEMS08`, `METR-LA`, `PEMS-BAY`, or any other dataset you want to use.
