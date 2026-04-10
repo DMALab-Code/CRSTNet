@@ -1,9 +1,9 @@
 import torch
 
 
-def masked_mae(prediction: torch.Tensor, targets: torch.Tensor, targets_mask: torch.Tensor = None) -> torch.Tensor:
+def masked_corr(prediction: torch.Tensor, targets: torch.Tensor, targets_mask: torch.Tensor) -> torch.Tensor:
     """
-    Calculate the Masked Mean Absolute Error (MAE) between the predicted and target values,
+    Calculate the Masked Pearson Correlation Coefficient between the predicted and target values,
     while ignoring the entries in the target tensor that match the specified null value.
 
     This function is particularly useful for scenarios where the dataset contains missing or irrelevant
@@ -22,11 +22,23 @@ def masked_mae(prediction: torch.Tensor, targets: torch.Tensor, targets_mask: to
     """
 
     mask = targets_mask if targets_mask is not None else torch.ones_like(targets)
+
     mask = mask.float()
     mask /= torch.mean(mask)  # Normalize mask to avoid bias in the loss due to the number of valid entries
     mask = torch.nan_to_num(mask)  # Replace any NaNs in the mask with zero
 
-    loss = torch.abs(prediction - targets)
+    prediction_mean = torch.mean(prediction, dim=1, keepdim=True)
+    target_mean = torch.mean(targets, dim=1, keepdim=True)
+
+    # Compute the deviation of prediction and target from their means
+    prediction_dev = prediction - prediction_mean
+    target_dev = targets - target_mean
+
+    # Compute the Pearson Correlation Coefficient
+    numerator = torch.sum(prediction_dev * target_dev, dim=1, keepdim=True)
+    denominator = torch.sqrt(torch.sum(prediction_dev ** 2, dim=1, keepdim=True) * torch.sum(target_dev ** 2, dim=1, keepdim=True))  # 分母
+    loss = numerator / denominator
+
     loss = loss * mask  # Apply the mask to the loss
     loss = torch.nan_to_num(loss)  # Replace any NaNs in the loss with zero
 

@@ -52,4 +52,6 @@ python experiments/train.py --cfg CRSTNet/${DATASET_NAME}.py --gpus '0'
 Replace `${DATASET_NAME}` with one of  `PEMS04`,  `PEMS08`, `METR-LA`, `PEMS-BAY`, or any other dataset you want to use.
 
 # Acknowledgement
+The baseline implementations in this repository are derived from BasicTS.
+
 We thank the authors of the following repository for code reference:[BasicTS](https://github.com/zezhishao/BasicTS)
