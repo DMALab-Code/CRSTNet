@@ -11,6 +11,7 @@ datasets  --> Raw datasets and preprocessed data
 experiments  --> Training scripts.
 
 scripts   --> Data preprocessing scripts.
+             `scripts/tune_bqh.py` is provided for BQH-related parameter search.
 
 CRSTNet/arch      --> The implementation of CRSTNet.
 
@@ -18,6 +19,9 @@ CRSTNet/${DATASET_NAME}.py    --> Training configs.
 ```
 
 Replace `${DATASET_NAME}` with one of  `PEMS04`,  `PEMS08`, `METR-LA`, `PEMS-BAY`, or any other dataset you want to use.
+
+# Implementation Location
+The CRSTNet implementation is located in `CRSTNet/arch/`. The dataset-specific configurations are in `CRSTNet/${DATASET_NAME}.py`, and the unified training and evaluation pipeline is organized under `experiments/` and `basicts/`. The public repository currently includes `scripts/tune_bqh.py` for BQH-related parameter search, but does not include a dedicated profiling script for automatic calibration of `delta_s`, `delta_e`, and `delta_d`.
 
 # Environment
 Python 3.11 + PyTorch 2.5.1 + CUDA 12.4 (Recommended)

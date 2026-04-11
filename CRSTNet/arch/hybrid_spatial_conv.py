@@ -1,243 +1,124 @@
+from typing import List, Optional, Sequence, Tuple
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
+
+from .efficient_clustering import build_condensed_adjacency, sym_normalize_adj
+
 
 class STGCNSpatialConv(nn.Module):
-    def __init__(self, in_channels=64, out_channels=64, feedback_weight=0.5, use_weighted_feedback=True):
+    """Hierarchical feature integration on the paper's two-layer H-Graph."""
+
+    def __init__(self, in_channels: int = 64, out_channels: int = 64, gamma: float = 0.5):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.feedback_weight = feedback_weight
-        self.use_weighted_feedback = use_weighted_feedback
+        self.gamma = gamma
 
-        self.intra_cluster_conv = nn.Linear(in_channels, out_channels)
+        self.lower_proj = nn.Linear(in_channels, out_channels)
+        self.upper_proj = nn.Linear(in_channels, out_channels)
+        self.query_proj = nn.Linear(out_channels, out_channels, bias=False)
 
-        self.global_conv = nn.Linear(in_channels, out_channels)
+    def _gcn(self, x: torch.Tensor, adj: np.ndarray, projection: nn.Linear) -> torch.Tensor:
+        if x.numel() == 0:
+            return x
 
-        self.feedback_fusion = nn.Linear(out_channels * 2, out_channels)
+        adj_norm = torch.tensor(sym_normalize_adj(adj), dtype=x.dtype, device=x.device)
+        aggregated = torch.einsum("ij,btjf->btif", adj_norm, x)
+        return torch.relu(projection(aggregated))
 
-        if self.use_weighted_feedback:
+    def _attention_pool(
+        self,
+        member_features: torch.Tensor,
+        prev_cluster_state: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if member_features.size(2) == 1:
+            pooled = member_features[:, :, 0, :]
+            return pooled, pooled
 
-            self.intra_weight = nn.Parameter(torch.tensor(0.5))
-
-            self.global_weight = nn.Parameter(torch.tensor(0.5))
-
-            self.node_importance_conv = nn.Linear(in_channels, 1)
-
-    def forward(self, X, adj, key_node_indices, cluster_indices_list):
-        batch_size, seq_len, num_nodes, features = X.shape
-        key_node_indices = [int(i) for i in key_node_indices if 0 <= i < num_nodes]
-
-        full_output = torch.zeros(batch_size, seq_len, num_nodes, self.out_channels, device=X.device)
-
-        sparse_adj = self._build_block_sparse_adj(adj, key_node_indices, cluster_indices_list)
-
-        key_intra_out = None
-        if len(key_node_indices) > 0:
-            key_X = X[:, :, key_node_indices, :]
-            key_A = adj[np.ix_(key_node_indices, key_node_indices)]
-            key_intra_out = self.basic_gcn(key_X, key_A)
-
-        cluster_intra_outputs = {}
-        cluster_centers = {}
-
-        for cluster_idx, c_idx in enumerate(cluster_indices_list):
-            c_idx = [int(i) for i in c_idx if 0 <= i < num_nodes]
-            if len(c_idx) == 0: continue
-
-            cluster_X = X[:, :, c_idx, :]
-
-            if self.use_weighted_feedback:
-
-                node_importance = self.node_importance_conv(cluster_X)
-                node_importance = torch.softmax(node_importance, dim=2)
-
-                weighted_cluster_center = torch.sum(cluster_X * node_importance, dim=2)
-            else:
-
-                weighted_cluster_center = cluster_X.mean(dim=2)
-
-            cluster_A = adj[np.ix_(c_idx, c_idx)]
-
-            cluster_intra_features = self.basic_gcn(cluster_X, cluster_A)
-
-            for i, node_idx in enumerate(c_idx):
-                cluster_intra_outputs[node_idx] = cluster_intra_features[:, :, i, :]
-                cluster_centers[node_idx] = weighted_cluster_center
-
-        global_nodes = []
-        global_features = []
-
-        if len(key_node_indices) > 0 and key_intra_out is not None:
-            global_nodes.extend(key_node_indices)
-            global_features.append(key_intra_out.mean(dim=2))
-
-        for cluster_idx, c_idx in enumerate(cluster_indices_list):
-            c_idx = [int(i) for i in c_idx if 0 <= i < num_nodes]
-            if len(c_idx) == 0: continue
-
-            cluster_center = cluster_centers[c_idx[0]]
-            global_features.append(cluster_center)
-
-        if len(global_features) > 1:
-            global_features = torch.stack(global_features, dim=2)
-            N_global = global_features.shape[2]
-
-            global_adj = np.eye(N_global)
-
-            global_out = self.basic_gcn(global_features, global_adj)
+        if prev_cluster_state is None:
+            query = member_features.mean(dim=2)
         else:
-            global_out = torch.stack(global_features, dim=2) if global_features else torch.zeros(batch_size, seq_len, 0, self.out_channels, device=X.device)
+            query = prev_cluster_state
 
-        global_idx = 0
+        query = F.normalize(self.query_proj(query), dim=-1)
+        normalized_members = F.normalize(member_features, dim=-1)
+        logits = torch.einsum("btnd,btd->btn", normalized_members, query)
+        attn = torch.softmax(logits, dim=2).unsqueeze(-1)
+        pooled = torch.sum(attn * member_features, dim=2)
+        return pooled, pooled
 
-        if len(key_node_indices) > 0:
-            for i, node_idx in enumerate(key_node_indices):
-                intra_feature = key_intra_out[:, :, i, :]
-                global_feature = global_out[:, :, global_idx, :]
+    def _build_subgraph_adj(self, adj: np.ndarray, members: Sequence[int]) -> np.ndarray:
+        members = [int(node) for node in members]
+        if not members:
+            return np.zeros((0, 0), dtype=np.float64)
+        return np.asarray(adj[np.ix_(members, members)], dtype=np.float64)
 
-                if self.use_weighted_feedback:
+    def forward(
+        self,
+        x: torch.Tensor,
+        adj: np.ndarray,
+        key_node_indices: Sequence[int],
+        cluster_indices_list: Sequence[Sequence[int]],
+        prev_cluster_states: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch_size, time_steps, num_nodes, _ = x.shape
+        key_node_indices = [int(node) for node in key_node_indices if 0 <= int(node) < num_nodes]
+        cluster_indices_list = [
+            [int(node) for node in cluster if 0 <= int(node) < num_nodes]
+            for cluster in cluster_indices_list
+            if len(cluster) > 0
+        ]
 
-                    weighted_intra = self.intra_weight * intra_feature
-                    weighted_global = self.global_weight * global_feature
-                    feedback_feature = torch.cat([weighted_intra, weighted_global], dim=-1)
-                else:
+        full_output = torch.zeros(batch_size, time_steps, num_nodes, self.out_channels, device=x.device, dtype=x.dtype)
+        condensed_inputs: List[torch.Tensor] = []
+        cluster_member_features: List[Tuple[List[int], torch.Tensor]] = []
+        updated_cluster_states: List[torch.Tensor] = []
 
-                    feedback_feature = torch.cat([intra_feature, global_feature], dim=-1)
+        for key_node in key_node_indices:
+            condensed_inputs.append(x[:, :, key_node, :])
 
-                final_feature = self.feedback_fusion(feedback_feature)
-                full_output[:, :, node_idx, :] = final_feature
-            global_idx += 1
+        for cluster_idx, members in enumerate(cluster_indices_list):
+            subgraph_adj = self._build_subgraph_adj(adj, members)
+            subgraph_x = x[:, :, members, :]
+            refined_members = self._gcn(subgraph_x, subgraph_adj, self.lower_proj)
 
-        for cluster_idx, c_idx in enumerate(cluster_indices_list):
-            c_idx = [int(i) for i in c_idx if 0 <= i < num_nodes]
-            if len(c_idx) == 0: continue
+            prev_state = None
+            if prev_cluster_states is not None and cluster_idx < prev_cluster_states.shape[2]:
+                prev_state = prev_cluster_states[:, :, cluster_idx, :]
 
-            cluster_global_feature = global_out[:, :, global_idx, :]
+            pooled, updated_state = self._attention_pool(refined_members, prev_state)
+            condensed_inputs.append(pooled)
+            cluster_member_features.append((members, refined_members))
+            updated_cluster_states.append(updated_state)
 
-            for node_idx in c_idx:
-                if node_idx in cluster_intra_outputs:
-                    intra_feature = cluster_intra_outputs[node_idx]
+        if condensed_inputs:
+            condensed_x = torch.stack(condensed_inputs, dim=2)
+            condensed_adj, _ = build_condensed_adjacency(key_node_indices, cluster_indices_list, adj, return_entities=False)
+            condensed_out = self._gcn(condensed_x, condensed_adj, self.upper_proj)
+        else:
+            condensed_out = torch.zeros(batch_size, time_steps, 0, self.out_channels, device=x.device, dtype=x.dtype)
 
-                    if self.use_weighted_feedback:
+        condensed_idx = 0
+        for key_node in key_node_indices:
+            if condensed_idx < condensed_out.shape[2]:
+                full_output[:, :, key_node, :] = condensed_out[:, :, condensed_idx, :]
+            condensed_idx += 1
 
-                        weighted_intra = self.intra_weight * intra_feature
-                        weighted_global = self.global_weight * cluster_global_feature
-                        feedback_feature = torch.cat([weighted_intra, weighted_global], dim=-1)
-                    else:
+        for members, refined_members in cluster_member_features:
+            if condensed_idx >= condensed_out.shape[2]:
+                break
+            cluster_feature = condensed_out[:, :, condensed_idx, :]
+            fused = self.gamma * cluster_feature.unsqueeze(2) + (1.0 - self.gamma) * refined_members
+            for member_offset, node_idx in enumerate(members):
+                full_output[:, :, node_idx, :] = fused[:, :, member_offset, :]
+            condensed_idx += 1
 
-                        feedback_feature = torch.cat([intra_feature, cluster_global_feature], dim=-1)
+        if updated_cluster_states:
+            cluster_states = torch.stack(updated_cluster_states, dim=2)
+        else:
+            cluster_states = torch.zeros(batch_size, time_steps, 0, self.out_channels, device=x.device, dtype=x.dtype)
 
-                    final_feature = self.feedback_fusion(feedback_feature)
-                    full_output[:, :, node_idx, :] = final_feature
-
-            global_idx += 1
-
-        return full_output
-
-    def basic_gcn(self, X, A_hat):
-
-        batch_size, seq_len, num_nodes, features = X.shape
-
-        norm = nn.LayerNorm(features).to(X.device)
-
-        X_reshaped = X.view(-1, features)
-        X_norm = norm(X_reshaped)
-        X_norm = X_norm.view(batch_size, seq_len, num_nodes, features)
-
-        A = torch.tensor(A_hat, dtype=X.dtype, device=X.device)
-
-        assert A.shape[0] == num_nodes and A.shape[1] == num_nodes,\
-            f"邻接矩阵维度 {A.shape} 与特征矩阵节点数 {num_nodes} 不匹配"
-
-        out_list = []
-        for t in range(seq_len):
-            X_t = X_norm[:, t, :, :]
-            out_t = torch.matmul(A, X_t)
-            out_t = self.global_conv(out_t)
-            out_list.append(out_t)
-
-        out = torch.stack(out_list, dim=1)
-        return out
-
-    def _build_block_sparse_adj(self, adj, key_node_indices, cluster_indices_list):
-
-        num_nodes = adj.shape[0]
-        num_super_nodes = len(cluster_indices_list)
-        total_nodes = len(key_node_indices) + num_super_nodes
-
-        sparse_adj = np.zeros((total_nodes, total_nodes))
-
-        for i, ki in enumerate(key_node_indices):
-            for j, kj in enumerate(key_node_indices):
-                if i != j and adj[ki, kj] > 0:
-                    sparse_adj[i, j] = adj[ki, kj]
-
-        for i, ki in enumerate(key_node_indices):
-            for j, cluster in enumerate(cluster_indices_list):
-                super_idx = len(key_node_indices) + j
-
-                for cluster_node in cluster:
-                    if adj[ki, cluster_node] > 0:
-                        sparse_adj[i, super_idx] = max(sparse_adj[i, super_idx], adj[ki, cluster_node])
-                        sparse_adj[super_idx, i] = sparse_adj[i, super_idx]
-
-        for i, cluster_i in enumerate(cluster_indices_list):
-            for j, cluster_j in enumerate(cluster_indices_list):
-                if i != j:
-                    super_i = len(key_node_indices) + i
-                    super_j = len(key_node_indices) + j
-
-                    max_weight = 0
-                    for node_i in cluster_i:
-                        for node_j in cluster_j:
-                            if adj[node_i, node_j] > 0:
-                                max_weight = max(max_weight, adj[node_i, node_j])
-                    if max_weight > 0:
-                        sparse_adj[super_i, super_j] = max_weight
-                        sparse_adj[super_j, super_i] = max_weight
-
-        return sparse_adj
-
-    def _super_node_aggregation(self, X, cluster_indices_list):
-
-        batch_size, seq_len, num_nodes, features = X.shape
-        num_super_nodes = len(cluster_indices_list)
-
-        if num_super_nodes == 0:
-            return torch.zeros(batch_size, seq_len, 0, features, device=X.device)
-
-        super_features = []
-        for cluster in cluster_indices_list:
-            if len(cluster) > 0:
-
-                cluster_X = X[:, :, cluster, :]
-                if self.use_weighted_feedback:
-
-                    node_importance = self.node_importance_conv(cluster_X)
-                    node_importance = torch.softmax(node_importance, dim=2)
-                    aggregated = torch.sum(cluster_X * node_importance, dim=2)
-                else:
-
-                    aggregated = cluster_X.mean(dim=2)
-                super_features.append(aggregated)
-
-        return torch.stack(super_features, dim=2)
-
-    def _distribute_super_features(self, super_features, cluster_indices_list, full_output):
-
-        batch_size, seq_len, num_nodes, out_channels = full_output.shape
-
-        for i, cluster in enumerate(cluster_indices_list):
-            if i < super_features.shape[2]:
-                super_feat = super_features[:, :, i, :]
-
-                for node_idx in cluster:
-                    if node_idx < num_nodes:
-
-                        member_feat = full_output[:, :, node_idx, :]
-                        fused_feat = member_feat + super_feat
-                        full_output[:, :, node_idx, :] = fused_feat
-
-        return full_output
+        return full_output, cluster_states

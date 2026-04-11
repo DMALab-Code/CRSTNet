@@ -1,1013 +1,753 @@
+import json
+import math
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
 import numpy as np
-import torch
-from joblib import Parallel, delayed
-from scipy.spatial.distance import squareform
-from scipy.cluster.hierarchy import linkage, fcluster
-from collections import defaultdict, deque
-from typing import Dict, List, Set, Tuple, Optional, Union
-import heapq
-from .key_node_selector import QuotaSwapKeySelector
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import shortest_path
 
-def select_dynamic_key_nodes(data, percentile=95, importance=None):
+from .key_node_selector import compute_importance_scores, select_top_theta
 
-    T, N, F = data.shape
 
-    entropies = np.zeros(N)
-    for i in range(N):
-        ts = data[:, i, 0]
-        hist, _ = np.histogram(ts, bins=20, density=True)
-        hist = hist + 1e-10
-        entropies[i] = -np.sum(hist * np.log(hist))
+def dtw_distance(ts1: np.ndarray, ts2: np.ndarray, window: Optional[int] = None) -> float:
+    """A lightweight DTW implementation for short traffic windows."""
 
-    latest = data[-1, :, 0]
-    prev = data[-2, :, 0]
-    change_rate = np.abs(latest - prev) / (np.abs(prev) + 1e-5)
+    n, m = len(ts1), len(ts2)
+    if n == 0 or m == 0:
+        return 0.0
 
-    entropies_norm = entropies / (np.max(entropies) + 1e-10)
-    change_rate_norm = change_rate / (np.max(change_rate) + 1e-10)
+    if window is None:
+        window = max(1, int(max(n, m) * 0.25))
 
-    scores = entropies_norm + change_rate_norm
-
-    if importance is not None:
-        importance_norm = importance / (np.max(importance) + 1e-10)
-        scores = scores + 0.5 * importance_norm
-
-    threshold = np.percentile(scores, percentile)
-    key_nodes = np.where(scores >= threshold)[0]
-    non_key_nodes = np.setdiff1d(np.arange(N), key_nodes)
-
-    return key_nodes, non_key_nodes, scores, threshold
-
-def efficient_dtw_distance(data, node_indices, top_k=5, downsample=4, n_jobs=4):
-
-    T, N, F = data.shape
-
-    if downsample > 1:
-        data_down = data[::downsample]
-    else:
-        data_down = data
-
-    def compute_dtw_pair(i, j):
-        if i >= j:
-            return 0.0
-        ts1 = data_down[:, node_indices[i], 0]
-        ts2 = data_down[:, node_indices[j], 0]
-        return fastdtw(ts1, ts2, radius=6)[0]
-
-    n_nodes = len(node_indices)
-    distances = Parallel(n_jobs=n_jobs)(
-        delayed(compute_dtw_pair)(i, j)
-        for i in range(n_nodes)
-        for j in range(i+1, n_nodes)
-    )
-
-    D = np.zeros((n_nodes, n_nodes))
-    idx = 0
-    for i in range(n_nodes):
-        for j in range(i+1, n_nodes):
-            D[i, j] = distances[idx]
-            D[j, i] = distances[idx]
-            idx += 1
-
-    return D
-
-def detect_distribution_change(data, prev_state=None, threshold=2.0):
-
-    T, N, F = data.shape
-
-    current_state = {
-        'mean': np.mean(data[:, :, 0], axis=0),
-        'std': np.std(data[:, :, 0], axis=0),
-        'trend': np.polyfit(np.arange(T), np.mean(data[:, :, 0], axis=1), 1)[0]
-    }
-
-    if prev_state is None:
-        return [], True, current_state
-
-    mean_change = np.abs(current_state['mean'] - prev_state['mean']) / (np.abs(prev_state['mean']) + 1e-5)
-    std_change = np.abs(current_state['std'] - prev_state['std']) / (np.abs(prev_state['std']) + 1e-5)
-    trend_change = np.abs(current_state['trend'] - prev_state['trend'])
-
-    change_score = mean_change + std_change + 0.1 * trend_change
-    changed_nodes = np.where(change_score > threshold)[0]
-
-    change_ratio = len(changed_nodes) / N
-    need_full_update = change_ratio > 0.3
-
-    return changed_nodes, need_full_update, current_state
-
-def fastdtw(x, y, radius=6):
-
-    n, m = len(x), len(y)
-    dtw_matrix = np.full((n + 1, m + 1), np.inf)
-    dtw_matrix[0, 0] = 0
-
+    dtw = np.full((n + 1, m + 1), np.inf, dtype=np.float64)
+    dtw[0, 0] = 0.0
     for i in range(1, n + 1):
-        for j in range(max(1, i - radius), min(m + 1, i + radius + 1)):
-            cost = abs(x[i-1] - y[j-1])
-            dtw_matrix[i, j] = cost + min(dtw_matrix[i-1, j], dtw_matrix[i, j-1], dtw_matrix[i-1, j-1])
+        j_start = max(1, i - window)
+        j_end = min(m + 1, i + window + 1)
+        for j in range(j_start, j_end):
+            cost = abs(ts1[i - 1] - ts2[j - 1])
+            dtw[i, j] = cost + min(dtw[i - 1, j], dtw[i, j - 1], dtw[i - 1, j - 1])
+    return float(dtw[n, m])
 
-    return dtw_matrix[n, m], None
 
-class TimeSeriesSummary:
+def infer_eta(values: np.ndarray) -> float:
+    """Infer the SMP tolerance from training statistics."""
 
-    def __init__(self, paa_segments=16):
-        self.paa_segments = paa_segments
-        self.count = 0
-        self.mu = None
-        self.env_upper = None
-        self.env_lower = None
-        self.last_update_ts = 0
-        self.members = set()
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    if values.size == 0:
+        return 1e-3
 
-    def update(self, ts, timestamp=0):
+    median = np.median(values)
+    mad = np.median(np.abs(values - median)) + 1e-8
+    robust_std = 1.4826 * mad
+    return float(max(0.1 * robust_std, 1e-4))
 
-        self.count += 1
-        self.last_update_ts = timestamp
 
-        paa_ts = self._paa_compress(ts)
+def split_slices(total_steps: int, slice_size: int) -> List[Tuple[int, int]]:
+    slice_size = max(1, int(slice_size))
+    return [(start, min(total_steps, start + slice_size)) for start in range(0, total_steps, slice_size)]
 
-        if self.mu is None:
-            self.mu = paa_ts
-            self.env_upper = paa_ts.copy()
-            self.env_lower = paa_ts.copy()
-        else:
 
-            alpha = 1.0 / self.count
-            self.mu = (1 - alpha) * self.mu + alpha * paa_ts
+def compute_member_slice_profiles(
+    data: np.ndarray,
+    members: Sequence[int],
+    slice_size: int,
+    feature_index: int = 0,
+) -> np.ndarray:
+    if data.ndim == 4:
+        data = data[0]
 
-            self.env_upper = np.maximum(self.env_upper, paa_ts)
-            self.env_lower = np.minimum(self.env_lower, paa_ts)
+    members = list(members)
+    if not members:
+        return np.zeros((0, 0), dtype=np.float64)
 
-    def _paa_compress(self, ts):
+    slices = split_slices(data.shape[0], slice_size)
+    profiles = np.zeros((len(members), len(slices)), dtype=np.float64)
+    for slice_idx, (start, end) in enumerate(slices):
+        segment = data[start:end, members, feature_index]
+        profiles[:, slice_idx] = np.mean(segment, axis=0)
+    return profiles
 
-        if len(ts) <= self.paa_segments:
-            return ts
 
-        segment_size = len(ts) // self.paa_segments
-        paa_ts = []
+def compute_cluster_slice_mean(member_profiles: np.ndarray) -> np.ndarray:
+    if member_profiles.size == 0:
+        return np.zeros(0, dtype=np.float64)
+    return np.mean(member_profiles, axis=0)
 
-        for i in range(self.paa_segments):
-            start = i * segment_size
-            end = min((i + 1) * segment_size, len(ts))
-            segment = ts[start:end]
-            paa_ts.append(np.mean(segment))
 
-        return np.array(paa_ts)
+def compute_residual_error(member_profiles: np.ndarray, cluster_profile: np.ndarray) -> float:
+    if member_profiles.size == 0:
+        return 0.0
+    return float(np.mean((member_profiles - cluster_profile[None, :]) ** 2))
 
-    def merge_with(self, other):
 
-        if other.count == 0:
-            return
+def compute_correlation_deviation(
+    candidate_profile: np.ndarray,
+    stable_low: np.ndarray,
+    stable_high: np.ndarray,
+) -> float:
+    candidate_profile = np.asarray(candidate_profile, dtype=np.float64)
+    stable_low = np.asarray(stable_low, dtype=np.float64)
+    stable_high = np.asarray(stable_high, dtype=np.float64)
+    above = np.maximum(0.0, candidate_profile - stable_high)
+    below = np.maximum(0.0, stable_low - candidate_profile)
+    return float(np.mean(above + below))
 
-        total_count = self.count + other.count
-        if total_count == 0:
-            return
 
-        if self.mu is None:
-            self.mu = other.mu.copy()
-            self.env_upper = other.env_upper.copy()
-            self.env_lower = other.env_lower.copy()
-        else:
+def compute_correlation_closeness(
+    profile_u: np.ndarray,
+    profile_v: np.ndarray,
+    max_backward_shift: Optional[int] = None,
+    epsilon: float = 1e-5,
+) -> Tuple[float, float]:
+    profile_u = np.asarray(profile_u, dtype=np.float64)
+    profile_v = np.asarray(profile_v, dtype=np.float64)
 
-            self.mu = (self.count * self.mu + other.count * other.mu) / total_count
+    if profile_u.size == 0 or profile_v.size == 0:
+        return 0.0, float("inf")
 
-            self.env_upper = np.maximum(self.env_upper, other.env_upper)
-            self.env_lower = np.minimum(self.env_lower, other.env_lower)
+    if max_backward_shift is None:
+        max_backward_shift = 2 * len(profile_u)
 
-        self.count = total_count
-        self.members.update(other.members)
+    best_mse = float("inf")
+    for shift in range(0, max_backward_shift + 1):
+        shifted = np.roll(profile_v, -shift)
+        if shift > 0:
+            shifted[-shift:] = profile_v[-1]
+        mse = float(np.mean((profile_u - shifted[: len(profile_u)]) ** 2))
+        best_mse = min(best_mse, mse)
 
-class HCIndex:
+    closeness = 1.0 / (best_mse + epsilon)
+    return closeness, best_mse
 
-    def __init__(self, graph_adj, paa_segments=16, window_ratio=0.1,
-                 eta_env=0.6, eta_mu=0.15, theta_merge=0.8, theta_var=0.5):
 
-        self.adj = graph_adj
-        self.paa_segments = paa_segments
-        self.window_ratio = window_ratio
-        self.eta_env = eta_env
-        self.eta_mu = eta_mu
-        self.theta_merge = theta_merge
-        self.theta_var = theta_var
+def compute_shortest_path_distances(adj: np.ndarray) -> np.ndarray:
+    matrix = np.asarray(adj, dtype=np.float64)
+    matrix = np.where(matrix > 0, matrix, 0.0)
+    return shortest_path(csgraph=csr_matrix(matrix), directed=False, unweighted=True)
 
-        self.super_summaries = {}
-        self.key_summaries = {}
-        self.node_to_super = {}
 
-        self.super_adjacency = defaultdict(set)
-        self._build_super_adjacency()
+def build_one_hop_dtw_cache(data: np.ndarray, adj: np.ndarray, feature_index: int = 0) -> Dict[Tuple[int, int], float]:
+    if data.ndim == 4:
+        data = data[0]
 
-        self.update_count = 0
-        self.merge_count = 0
-        self.split_count = 0
+    cache: Dict[Tuple[int, int], float] = {}
+    num_nodes = data.shape[1]
+    for i in range(num_nodes):
+        for j in range(i + 1, num_nodes):
+            if adj[i, j] > 0 or adj[j, i] > 0:
+                cache[(i, j)] = dtw_distance(data[:, i, feature_index], data[:, j, feature_index])
+    return cache
 
-    def _build_super_adjacency(self):
 
-        n = self.adj.shape[0]
-        for i in range(n):
-            for j in range(n):
-                if self.adj[i, j] > 0:
+def aggregate_boundary_weight(cluster_a: Sequence[int], cluster_b: Sequence[int], adj: np.ndarray) -> float:
+    if not cluster_a or not cluster_b:
+        return 0.0
 
-                    self.super_adjacency[i].add(j)
+    boundary = np.asarray(adj[np.ix_(cluster_a, cluster_b)], dtype=np.float64)
+    weight = float(np.sum(boundary))
+    if weight <= 0.0:
+        return 0.0
+    return weight / math.sqrt(max(1.0, len(cluster_a) * len(cluster_b)))
 
-    def update_summary(self, node_id, ts, timestamp=0, is_key=False):
 
-        if is_key:
-            if node_id not in self.key_summaries:
-                self.key_summaries[node_id] = TimeSeriesSummary(self.paa_segments)
-            self.key_summaries[node_id].update(ts, timestamp)
-        else:
+def build_condensed_adjacency(
+    key_nodes: Sequence[int],
+    clusters: Sequence[Sequence[int]],
+    adj: np.ndarray,
+    return_entities: bool = False,
+) -> Tuple[np.ndarray, Optional[List[Tuple[str, object, List[int]]]]]:
+    entities: List[Tuple[str, object, List[int]]] = [("key", int(node), [int(node)]) for node in key_nodes]
+    entities.extend(("cluster", tuple(sorted(int(v) for v in cluster)), [int(v) for v in cluster]) for cluster in clusters if len(cluster) > 0)
 
-            super_id = self.node_to_super.get(node_id, node_id)
-            if super_id not in self.super_summaries:
-                self.super_summaries[super_id] = TimeSeriesSummary(self.paa_segments)
-            self.super_summaries[super_id].update(ts, timestamp)
-            self.super_summaries[super_id].members.add(node_id)
+    num_entities = len(entities)
+    condensed = np.zeros((num_entities, num_entities), dtype=np.float64)
+    for i in range(num_entities):
+        condensed[i, i] = 1.0
+        for j in range(i + 1, num_entities):
+            members_i = entities[i][2]
+            members_j = entities[j][2]
+            weight = aggregate_boundary_weight(members_i, members_j, adj)
+            if weight > 0.0:
+                condensed[i, j] = weight
+                condensed[j, i] = weight
 
-    def neighbors_of(self, node_or_cluster_id):
+    return condensed, entities if return_entities else None
 
-        if node_or_cluster_id in self.super_adjacency:
-            return list(self.super_adjacency[node_or_cluster_id])
-        return []
 
-    def lb_kim(self, ts1, ts2):
+def sym_normalize_adj(adj: np.ndarray) -> np.ndarray:
+    adj = np.asarray(adj, dtype=np.float64)
+    degree = np.sum(adj, axis=1)
+    degree = np.where(degree > 0.0, degree, 1.0)
+    inv_sqrt = np.power(degree, -0.5)
+    return inv_sqrt[:, None] * adj * inv_sqrt[None, :]
 
-        if len(ts1) == 0 or len(ts2) == 0:
-            return float('inf')
 
-        endpoint_dist = (ts1[0] - ts2[0]) ** 2 + (ts1[-1] - ts2[-1]) ** 2
+def composite_distance(
+    node_i: int,
+    node_j: int,
+    shortest_distances: np.ndarray,
+    dtw_cache: Dict[Tuple[int, int], float],
+    lambda_value: float,
+    d0: float,
+    tau0: float,
+) -> float:
+    pair = (min(node_i, node_j), max(node_i, node_j))
+    spatial = float(shortest_distances[node_i, node_j])
+    if not np.isfinite(spatial):
+        return float("inf")
 
-        min1, max1 = np.min(ts1), np.max(ts1)
-        min2, max2 = np.min(ts2), np.max(ts2)
-        extremum_dist = max(0, max1 - min2) ** 2 + max(0, max2 - min1) ** 2
+    spatial = spatial / max(d0, 1e-5)
+    temporal = float(dtw_cache.get(pair, 0.0)) / max(tau0, 1e-5)
+    return float(lambda_value * spatial + (1.0 - lambda_value) * temporal)
 
-        return np.sqrt(endpoint_dist + extremum_dist)
 
-    def lb_keogh(self, ts_paa, env_lower, env_upper):
+def _clusters_are_adjacent(cluster_a: Sequence[int], cluster_b: Sequence[int], adj: np.ndarray) -> bool:
+    for node_i in cluster_a:
+        for node_j in cluster_b:
+            if adj[node_i, node_j] > 0 or adj[node_j, node_i] > 0:
+                return True
+    return False
 
-        if env_lower is None or env_upper is None:
-            return float('inf')
 
-        min_len = min(len(ts_paa), len(env_lower), len(env_upper))
-        ts_paa = ts_paa[:min_len]
-        env_lower = env_lower[:min_len]
-        env_upper = env_upper[:min_len]
+def _merge_cost(
+    cluster_a: Sequence[int],
+    cluster_b: Sequence[int],
+    data: np.ndarray,
+    adj: np.ndarray,
+    shortest_distances: np.ndarray,
+    dtw_cache: Dict[Tuple[int, int], float],
+    lambda_value: float,
+    d0: float,
+    tau0: float,
+    feature_index: int = 0,
+) -> float:
+    if not _clusters_are_adjacent(cluster_a, cluster_b, adj):
+        return float("inf")
 
-        lb_sum = 0.0
-        for i in range(min_len):
-            if ts_paa[i] > env_upper[i]:
-                lb_sum += (ts_paa[i] - env_upper[i]) ** 2
-            elif ts_paa[i] < env_lower[i]:
-                lb_sum += (env_lower[i] - ts_paa[i]) ** 2
-
-        return np.sqrt(lb_sum)
-
-    def multi_level_pruning(self, ts1, ts2, threshold=float('inf')):
-
-        lb_kim_dist = self.lb_kim(ts1, ts2)
-        if lb_kim_dist >= threshold:
-            return lb_kim_dist, False
-
-        ts1_paa = self._paa_compress(ts1)
-        ts2_paa = self._paa_compress(ts2)
-
-        env_lower = np.minimum(ts1_paa, ts2_paa)
-        env_upper = np.maximum(ts1_paa, ts2_paa)
-
-        lb_keogh_dist = self.lb_keogh(ts1_paa, env_lower, env_upper)
-        if lb_keogh_dist >= threshold:
-            return lb_keogh_dist, False
-
-        return self._compute_dtw_with_early_stop(ts1, ts2, threshold), True
-
-    def _compute_dtw_with_early_stop(self, ts1, ts2, threshold, window_ratio=0.1):
-
-        n, m = len(ts1), len(ts2)
-        w = max(1, int(window_ratio * max(n, m)))
-
-        dtw_matrix = np.full((n + 1, m + 1), np.inf)
-        dtw_matrix[0, 0] = 0
-
-        for i in range(1, n + 1):
-            for j in range(max(1, i - w), min(m + 1, i + w + 1)):
-                cost = abs(ts1[i-1] - ts2[j-1])
-                dtw_matrix[i, j] = cost + min(
-                    dtw_matrix[i-1, j],
-                    dtw_matrix[i, j-1],
-                    dtw_matrix[i-1, j-1]
+    boundary_distances: List[float] = []
+    for node_i in cluster_a:
+        for node_j in cluster_b:
+            if adj[node_i, node_j] > 0 or adj[node_j, node_i] > 0:
+                boundary_distances.append(
+                    composite_distance(node_i, node_j, shortest_distances, dtw_cache, lambda_value, d0, tau0)
                 )
 
-                if dtw_matrix[i, j] >= threshold:
-                    return threshold
-
-        return dtw_matrix[n, m]
-
-    def get_center(self, super_id):
-
-        if super_id in self.super_summaries:
-            summary = self.super_summaries[super_id]
-            return summary.mu if summary.mu is not None else None
-        return None
-
-    def estimate_marginal_gain(self, u, K, data, lambda_cov=0.5, alpha_sim=0.5):
-
-        if u in K:
-            return 0.0
-
-        if u >= data.shape[1]:
-            return 0.0
-        ts = data[:, u, 0]
-        ts_paa = self._paa_compress(ts)
-
-        importance_score = np.var(ts)
-
-        coverage_gain = 0.0
-        neighbors = self.neighbors_of(u)
-
-        max_neighbors = min(10, len(neighbors))
-        for neighbor_id in neighbors[:max_neighbors]:
-            if neighbor_id in self.super_summaries:
-                summary = self.super_summaries[neighbor_id]
-                if summary.env_upper is not None and summary.env_lower is not None:
-
-                    lb_dist = self.lb_keogh(ts_paa, summary.env_lower, summary.env_upper)
-                    if lb_dist < self.theta_merge:
-                        coverage_gain += 1.0 / (1.0 + lb_dist)
-
-        total_gain = lambda_cov * importance_score + (1 - lambda_cov) * coverage_gain
-        return total_gain
-
-    def estimate_retain_gain(self, w, K, data):
-
-        if w not in K:
-            return 0.0
-
-        if w >= data.shape[1]:
-            return 0.0
-        ts = data[:, w, 0]
-        return self._compute_importance_score(ts)
-
-    def _paa_compress(self, ts):
-
-        if len(ts) <= self.paa_segments:
-            return ts
-
-        segment_size = len(ts) // self.paa_segments
-        paa_ts = []
-
-        for i in range(self.paa_segments):
-            start = i * segment_size
-            end = min((i + 1) * segment_size, len(ts))
-            segment = ts[start:end]
-            paa_ts.append(np.mean(segment))
-
-        return np.array(paa_ts)
-
-    def _compute_importance_score(self, ts):
-
-        hist, _ = np.histogram(ts, bins=20, density=True)
-        hist = hist + 1e-10
-        entropy = -np.sum(hist * np.log(hist))
-
-        if len(ts) > 1:
-            change_rate = np.abs(ts[-1] - ts[-2]) / (np.abs(ts[-2]) + 1e-5)
-        else:
-            change_rate = 0.0
-
-        return entropy + change_rate
-
-    def try_merge(self, ci, cj):
-
-        if ci not in self.super_summaries or cj not in self.super_summaries:
-            return False
-
-        summary_i = self.super_summaries[ci]
-        summary_j = self.super_summaries[cj]
-
-        if not self._envelope_overlap(summary_i, summary_j):
-            return False
-
-        if not self._mean_close(summary_i, summary_j):
-            return False
-
-        if summary_i.mu is not None and summary_j.mu is not None:
-            dtw_dist = self._compute_dtw(summary_i.mu, summary_j.mu)
-            if dtw_dist <= self.theta_merge:
-
-                summary_i.merge_with(summary_j)
-                del self.super_summaries[cj]
-                self.merge_count += 1
-                return True
-
-        return False
-
-    def try_split(self, c):
-
-        if c not in self.super_summaries:
-            return False
-
-        summary = self.super_summaries[c]
-
-        if not (self._var_large(summary) or self._env_wide(summary)):
-            return False
-
-        if len(summary.members) < 2:
-            return False
-
-        members = list(summary.members)
-        if len(members) < 2:
-            return False
-
-        mid = len(members) // 2
-        sub1_members = set(members[:mid])
-        sub2_members = set(members[mid:])
-
-        new_c1 = max(self.super_summaries.keys()) + 1 if self.super_summaries else 0
-        new_c2 = new_c1 + 1
-
-        self.super_summaries[new_c1] = TimeSeriesSummary(self.paa_segments)
-        self.super_summaries[new_c2] = TimeSeriesSummary(self.paa_segments)
-
-        for member in sub1_members:
-            self.node_to_super[member] = new_c1
-            self.super_summaries[new_c1].members.add(member)
-        for member in sub2_members:
-            self.node_to_super[member] = new_c2
-            self.super_summaries[new_c2].members.add(member)
-
-        del self.super_summaries[c]
-        self.split_count += 1
-        return True
-
-    def _envelope_overlap(self, summary_i, summary_j):
-
-        if (summary_i.env_upper is None or summary_i.env_lower is None or
-            summary_j.env_upper is None or summary_j.env_lower is None):
-            return False
-
-        overlap = 0
-        total = 0
-        min_len = min(len(summary_i.env_upper), len(summary_j.env_upper))
-
-        for i in range(min_len):
-            if (summary_i.env_lower[i] <= summary_j.env_upper[i] and
-                summary_j.env_lower[i] <= summary_i.env_upper[i]):
-                overlap += 1
-            total += 1
-
-        return overlap / total >= self.eta_env if total > 0 else False
-
-    def _mean_close(self, summary_i, summary_j):
-
-        if summary_i.mu is None or summary_j.mu is None:
-            return False
-
-        mean_diff = np.linalg.norm(summary_i.mu - summary_j.mu)
-        return mean_diff <= self.eta_mu
-
-    def _var_large(self, summary):
-
-        if summary.mu is None:
-            return False
-
-        var_estimate = np.var(summary.mu)
-        return var_estimate >= self.theta_var
-
-    def _env_wide(self, summary):
-
-        if summary.env_upper is None or summary.env_lower is None:
-            return False
-
-        width = np.mean(summary.env_upper - summary.env_lower)
-        return width >= self.theta_var
-
-    def _compute_dtw(self, ts1, ts2):
-
-        return fastdtw(ts1, ts2, radius=int(self.window_ratio * len(ts1)))[0]
-
-    def local_insert_or_swap(self, u, as_key=False, data=None):
-
-        if as_key:
-
-            if u not in self.key_summaries:
-                self.key_summaries[u] = TimeSeriesSummary(self.paa_segments)
-            if data is not None and u < data.shape[1]:
-                ts = data[:, u, 0]
-                self.key_summaries[u].update(ts)
-        else:
-
-            if data is not None and u < data.shape[1]:
-                ts = data[:, u, 0]
-                ts_paa = self._paa_compress(ts)
-
-                best_super = None
-                best_dist = float('inf')
-
-                neighbors = self.neighbors_of(u)
-                for neighbor_id in neighbors:
-                    if neighbor_id in self.super_summaries:
-                        summary = self.super_summaries[neighbor_id]
-                        if summary.env_upper is not None and summary.env_lower is not None:
-                            lb_dist = self.lb_keogh(ts_paa, summary.env_lower, summary.env_upper)
-                            if lb_dist < best_dist:
-                                best_dist = lb_dist
-                                best_super = neighbor_id
-
-                if best_super is not None and best_dist <= self.theta_merge:
-
-                    self.node_to_super[u] = best_super
-                    self.super_summaries[best_super].members.add(u)
-                    self.super_summaries[best_super].update(ts)
-                else:
-
-                    new_super_id = max(self.super_summaries.keys()) + 1 if self.super_summaries else 0
-                    self.super_summaries[new_super_id] = TimeSeriesSummary(self.paa_segments)
-                    self.super_summaries[new_super_id].members.add(u)
-                    self.super_summaries[new_super_id].update(ts)
-                    self.node_to_super[u] = new_super_id
-
-    def get_statistics(self):
-
-        return {
-            'num_super_nodes': len(self.super_summaries),
-            'num_key_nodes': len(self.key_summaries),
-            'update_count': self.update_count,
-            'merge_count': self.merge_count,
-            'split_count': self.split_count,
-            'total_members': sum(len(s.members) for s in self.super_summaries.values())
-        }
-
-class LocalOperationManager:
-
-    def __init__(self, hc_index, quota_selector, theta_join=0.9, theta_outlier=1.5):
-
-        self.hc_index = hc_index
-        self.quota_selector = quota_selector
-        self.theta_join = theta_join
-        self.theta_outlier = theta_outlier
-
-        self.promotion_count = 0
-        self.demotion_count = 0
-        self.reassignment_count = 0
-        self.outlier_count = 0
-
-    def promote_node(self, u, data):
-
-        if u in self.quota_selector.K:
-            return True
-
-        if len(self.quota_selector.K) < self.quota_selector.Q:
-
-            self.quota_selector.K.add(u)
-            if u in self.hc_index.node_to_super:
-
-                super_id = self.hc_index.node_to_super[u]
-                if super_id in self.hc_index.super_summaries:
-                    self.hc_index.super_summaries[super_id].members.discard(u)
-                del self.hc_index.node_to_super[u]
-
-            if u < data.shape[1]:
-                ts = data[:, u, 0]
-                self.hc_index.update_summary(u, ts, is_key=True)
-
-            self.promotion_count += 1
-            return True
-        else:
-
-            return self._try_swap_promotion(u, data)
-
-    def demote_node(self, u, data):
-
-        if u not in self.quota_selector.K:
-            return True
-
-        self.quota_selector.K.discard(u)
-
-        best_super = self._find_best_super_for_node(u, data)
-
-        if best_super is not None:
-
-            self.hc_index.node_to_super[u] = best_super
-            self.hc_index.super_summaries[best_super].members.add(u)
-            if u < data.shape[1]:
-                ts = data[:, u, 0]
-                self.hc_index.super_summaries[best_super].update(ts)
-        else:
-
-            self._create_new_super_for_node(u, data)
-
-        self.demotion_count += 1
-        return True
-
-    def reassign_outlier(self, u, data):
-
-        if u in self.quota_selector.K:
-            return True
-
-        if not self._is_outlier(u, data):
-            return True
-
-        best_super = self._find_best_super_for_node(u, data)
-
-        if best_super is not None:
-
-            old_super = self.hc_index.node_to_super.get(u)
-            if old_super and old_super in self.hc_index.super_summaries:
-                self.hc_index.super_summaries[old_super].members.discard(u)
-
-            self.hc_index.node_to_super[u] = best_super
-            self.hc_index.super_summaries[best_super].members.add(u)
-            if u < data.shape[1]:
-                ts = data[:, u, 0]
-                self.hc_index.super_summaries[best_super].update(ts)
-
-            self.reassignment_count += 1
-        else:
-
-            self._create_new_super_for_node(u, data)
-            self.outlier_count += 1
-
-        return True
-
-    def _try_swap_promotion(self, u, data):
-
-        gain_u = self.hc_index.estimate_marginal_gain(u, self.quota_selector.K, data)
-
-        if not self.quota_selector.min_heap:
-            return False
-
-        rg_w, w_star = self.quota_selector.min_heap[0]
-
-        swap_gain = gain_u - rg_w
-
-        if swap_gain > self.quota_selector.tau_swap:
-
-            self.quota_selector.K.remove(w_star)
-            self.quota_selector.K.add(u)
-
-            heapq.heapreplace(self.quota_selector.min_heap,
-                            (self.hc_index.estimate_retain_gain(u, self.quota_selector.K, data), u))
-
-            self.demote_node(w_star, data)
-
-            if u < data.shape[1]:
-                ts = data[:, u, 0]
-                self.hc_index.update_summary(u, ts, is_key=True)
-
-            self.promotion_count += 1
-            return True
-
-        return False
-
-    def _find_best_super_for_node(self, u, data):
-
-        if u >= data.shape[1]:
-            return None
-
-        ts = data[:, u, 0]
-        ts_paa = self.hc_index._paa_compress(ts)
-
-        best_super = None
-        best_dist = float('inf')
-
-        neighbors = self.hc_index.neighbors_of(u)
-        for neighbor_id in neighbors:
-            if neighbor_id in self.hc_index.super_summaries:
-                summary = self.hc_index.super_summaries[neighbor_id]
-                if summary.env_upper is not None and summary.env_lower is not None:
-                    lb_dist = self.hc_index.lb_keogh(ts_paa, summary.env_lower, summary.env_upper)
-                    if lb_dist < best_dist and lb_dist <= self.theta_join:
-                        best_dist = lb_dist
-                        best_super = neighbor_id
-
-        return best_super
-
-    def _create_new_super_for_node(self, u, data):
-
-        new_super_id = max(self.hc_index.super_summaries.keys()) + 1 if self.hc_index.super_summaries else 0
-
-        self.hc_index.super_summaries[new_super_id] = TimeSeriesSummary(self.hc_index.paa_segments)
-        self.hc_index.super_summaries[new_super_id].members.add(u)
-        self.hc_index.node_to_super[u] = new_super_id
-
-        if u < data.shape[1]:
-            ts = data[:, u, 0]
-            self.hc_index.super_summaries[new_super_id].update(ts)
-
-    def _is_outlier(self, u, data):
-
-        if u >= data.shape[1]:
-            return False
-
-        ts = data[:, u, 0]
-        ts_paa = self.hc_index._paa_compress(ts)
-
-        neighbors = self.hc_index.neighbors_of(u)
-        min_dist = float('inf')
-
-        for neighbor_id in neighbors:
-            if neighbor_id in self.hc_index.super_summaries:
-                summary = self.hc_index.super_summaries[neighbor_id]
-                if summary.env_upper is not None and summary.env_lower is not None:
-                    lb_dist = self.hc_index.lb_keogh(ts_paa, summary.env_lower, summary.env_upper)
-                    min_dist = min(min_dist, lb_dist)
-
-        return min_dist > self.theta_outlier
-
-    def batch_operations(self, data, operation_list):
-
-        results = []
-
-        for op_type, u in operation_list:
-            if op_type == 'promote':
-                success = self.promote_node(u, data)
-            elif op_type == 'demote':
-                success = self.demote_node(u, data)
-            elif op_type == 'reassign':
-                success = self.reassign_outlier(u, data)
-            else:
-                success = False
-
-            results.append((op_type, u, success))
-
-        return results
-
-    def get_statistics(self):
-
-        return {
-            'promotion_count': self.promotion_count,
-            'demotion_count': self.demotion_count,
-            'reassignment_count': self.reassignment_count,
-            'outlier_count': self.outlier_count,
-            'total_operations': (self.promotion_count + self.demotion_count +
-                               self.reassignment_count + self.outlier_count)
-        }
-
-class SuperNodeManager:
-
-    def __init__(self, hc_index, merge_cooldown=20, split_cooldown=20):
-
-        self.hc_index = hc_index
-        self.merge_cooldown = merge_cooldown
-        self.split_cooldown = split_cooldown
-
-        self.last_merge_time = 0
-        self.last_split_time = 0
-
-        self.merge_attempts = 0
-        self.merge_successes = 0
-        self.split_attempts = 0
-        self.split_successes = 0
-
-    def try_merge_operations(self, current_step, data):
-
-        if current_step - self.last_merge_time < self.merge_cooldown:
-            return []
-
-        merge_results = []
-        super_ids = list(self.hc_index.super_summaries.keys())
-
-        for i, ci in enumerate(super_ids):
-            for j, cj in enumerate(super_ids[i+1:], i+1):
-                if self._are_neighbors(ci, cj):
-                    self.merge_attempts += 1
-                    success = self.hc_index.try_merge(ci, cj)
-                    if success:
-                        self.merge_successes += 1
-                        merge_results.append((ci, cj, True))
-                    else:
-                        merge_results.append((ci, cj, False))
-
-        self.last_merge_time = current_step
-        return merge_results
-
-    def try_split_operations(self, current_step, data):
-
-        if current_step - self.last_split_time < self.split_cooldown:
-            return []
-
-        split_results = []
-        super_ids = list(self.hc_index.super_summaries.keys())
-
-        for ci in super_ids:
-            if self._should_split(ci):
-                self.split_attempts += 1
-                success = self.hc_index.try_split(ci)
-                if success:
-                    self.split_successes += 1
-                    split_results.append((ci, True))
-                else:
-                    split_results.append((ci, False))
-
-        self.last_split_time = current_step
-        return split_results
-
-    def _are_neighbors(self, ci, cj):
-
-        members_i = self.hc_index.super_summaries[ci].members
-        members_j = self.hc_index.super_summaries[cj].members
-
-        for mi in members_i:
-            for mj in members_j:
-                if (mi < self.hc_index.adj.shape[0] and
-                    mj < self.hc_index.adj.shape[1] and
-                    self.hc_index.adj[mi, mj] > 0):
-                    return True
-        return False
-
-    def _should_split(self, ci):
-
-        if ci not in self.hc_index.super_summaries:
-            return False
-
-        summary = self.hc_index.super_summaries[ci]
-
-        if len(summary.members) < 2:
-            return False
-
-        if summary.mu is not None:
-            var_estimate = np.var(summary.mu)
-            if var_estimate >= self.hc_index.theta_var:
-                return True
-
-        if (summary.env_upper is not None and summary.env_lower is not None):
-            width = np.mean(summary.env_upper - summary.env_lower)
-            if width >= self.hc_index.theta_var:
-                return True
-
-        return False
-
-    def batch_merge_split(self, current_step, data):
-
-        merge_results = self.try_merge_operations(current_step, data)
-        split_results = self.try_split_operations(current_step, data)
-
-        return {
-            'merge_results': merge_results,
-            'split_results': split_results,
-            'merge_attempts': self.merge_attempts,
-            'merge_successes': self.merge_successes,
-            'split_attempts': self.split_attempts,
-            'split_successes': self.split_successes
-        }
-
-    def get_statistics(self):
-
-        return {
-            'merge_attempts': self.merge_attempts,
-            'merge_successes': self.merge_successes,
-            'merge_success_rate': self.merge_successes / max(1, self.merge_attempts),
-            'split_attempts': self.split_attempts,
-            'split_successes': self.split_successes,
-            'split_success_rate': self.split_successes / max(1, self.split_attempts),
-            'last_merge_time': self.last_merge_time,
-            'last_split_time': self.last_split_time
-        }
-
-class OptimizedStructureManager:
-
-    def __init__(self, graph_adj, quota_ratio=0.1, paa_segments=16,
-                 merge_cooldown=20, split_cooldown=20, dtw_budget=100, swap_budget=50, fast_mode=True):
-
-        self.fast_mode = fast_mode
-        self.hc_index = HCIndex(graph_adj, paa_segments=paa_segments)
-        self.quota_selector = QuotaSwapKeySelector(quota_ratio=quota_ratio)
-        self.local_ops = LocalOperationManager(self.hc_index, self.quota_selector)
-        self.super_manager = SuperNodeManager(self.hc_index, merge_cooldown, split_cooldown)
-
-        self.quota_selector.prepare(graph_adj.shape[0], self.hc_index)
+    if not boundary_distances:
+        return float("inf")
+
+    series_a = np.mean(data[:, list(cluster_a), feature_index], axis=1)
+    series_b = np.mean(data[:, list(cluster_b), feature_index], axis=1)
+    centroid_gap = np.mean((series_a - series_b) ** 2)
+    ward_term = (len(cluster_a) * len(cluster_b) / max(1, len(cluster_a) + len(cluster_b))) * centroid_gap
+    return float(ward_term + np.mean(boundary_distances))
+
+
+def estimate_target_cluster_count(num_nodes: int) -> int:
+    if num_nodes <= 1:
+        return num_nodes
+    return max(1, int(math.ceil(math.sqrt(num_nodes))))
+
+
+def topology_constrained_ward(
+    nodes: Sequence[int],
+    adj: np.ndarray,
+    data: np.ndarray,
+    shortest_distances: np.ndarray,
+    lambda_value: float,
+    dtw_cache: Dict[Tuple[int, int], float],
+    target_clusters: Optional[int] = None,
+    feature_index: int = 0,
+) -> List[List[int]]:
+    nodes = sorted(int(node) for node in nodes)
+    if not nodes:
+        return []
+    if len(nodes) == 1:
+        return [nodes]
+
+    if target_clusters is None:
+        target_clusters = estimate_target_cluster_count(len(nodes))
+    target_clusters = max(1, min(int(target_clusters), len(nodes)))
+
+    dtw_values = np.array(list(dtw_cache.values()), dtype=np.float64) if dtw_cache else np.array([1.0], dtype=np.float64)
+    tau0 = float(np.median(dtw_values)) if dtw_values.size > 0 else 1.0
+    d0 = float(np.median(shortest_distances[np.isfinite(shortest_distances) & (shortest_distances > 0)]))
+    if not np.isfinite(d0):
+        d0 = 1.0
+
+    clusters: Dict[int, List[int]] = {idx: [node] for idx, node in enumerate(nodes)}
+    next_cluster_id = len(clusters)
+    while len(clusters) > target_clusters:
+        best_pair: Optional[Tuple[int, int]] = None
+        best_cost = float("inf")
+        cluster_items = list(clusters.items())
+        for i, (cluster_id_i, cluster_i) in enumerate(cluster_items):
+            for cluster_id_j, cluster_j in cluster_items[i + 1 :]:
+                cost = _merge_cost(
+                    cluster_i,
+                    cluster_j,
+                    data=data,
+                    adj=adj,
+                    shortest_distances=shortest_distances,
+                    dtw_cache=dtw_cache,
+                    lambda_value=lambda_value,
+                    d0=d0,
+                    tau0=tau0,
+                    feature_index=feature_index,
+                )
+                if cost < best_cost:
+                    best_cost = cost
+                    best_pair = (cluster_id_i, cluster_id_j)
+
+        if best_pair is None or not np.isfinite(best_cost):
+            break
+
+        first_id, second_id = best_pair
+        merged = sorted(clusters.pop(first_id) + clusters.pop(second_id))
+        clusters[next_cluster_id] = merged
+        next_cluster_id += 1
+
+    return [members for _, members in sorted(clusters.items(), key=lambda item: (len(item[1]), item[1][0]))]
+
+
+def efficient_dtw_distance(data: np.ndarray, node_indices: Sequence[int], top_k: int = 5, downsample: int = 1, n_jobs: int = 1) -> np.ndarray:
+    del top_k, n_jobs
+
+    if data.ndim == 4:
+        data = data[0]
+    node_indices = list(node_indices)
+
+    sampled = data[:: max(1, downsample)]
+    size = len(node_indices)
+    matrix = np.zeros((size, size), dtype=np.float64)
+    for i in range(size):
+        for j in range(i + 1, size):
+            matrix[i, j] = dtw_distance(sampled[:, node_indices[i], 0], sampled[:, node_indices[j], 0])
+            matrix[j, i] = matrix[i, j]
+    return matrix
+
+
+def select_dynamic_key_nodes(
+    data: np.ndarray,
+    percentile: float = 95.0,
+    importance: Optional[np.ndarray] = None,
+    theta: Optional[float] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    del importance
+
+    scores, _, _ = compute_importance_scores(data)
+    if theta is None:
+        theta = max(0.0, 1.0 - percentile / 100.0)
+    key_nodes = select_top_theta(scores, theta)
+    non_key_nodes = np.setdiff1d(np.arange(scores.shape[0]), key_nodes)
+    threshold = float(scores[key_nodes[-1]]) if len(key_nodes) > 0 else float(np.max(scores))
+    return key_nodes, non_key_nodes, scores, threshold
+
+
+def detect_distribution_change(data: np.ndarray, prev_state=None, threshold: float = 2.0) -> Tuple[np.ndarray, bool, Dict[str, np.ndarray]]:
+    scores, _, _ = compute_importance_scores(data)
+    current_state = {"scores": scores}
+    if prev_state is None:
+        return np.arange(scores.shape[0]), True, current_state
+
+    prev_scores = np.asarray(prev_state.get("scores", np.zeros_like(scores)))
+    delta = np.abs(scores - prev_scores)
+    changed = np.where(delta > threshold * np.mean(delta + 1e-5))[0]
+    need_full_update = len(changed) > 0.3 * len(scores)
+    return changed, bool(need_full_update), current_state
+
+
+@dataclass
+class StableRangeState:
+    low: np.ndarray
+    high: np.ndarray
+
+
+@dataclass
+class EntityProfile:
+    kind: str
+    members: List[int]
+    state_key: Tuple[str, object]
+    smp: np.ndarray
+    member_profiles: np.ndarray
+    stable_low: np.ndarray
+    stable_high: np.ndarray
+    residual: float
+    out_of_range: bool
+    member_cd: Dict[int, float]
+
+
+class PaperAlignedStructureManager:
+    """Maintain the H-Graph using the paper's SMP/SANI rules."""
+
+    def __init__(
+        self,
+        graph_adj: np.ndarray,
+        theta: float = 0.2,
+        lambda_value: float = 0.5,
+        maintenance_interval: int = 5,
+        delta_s: Optional[float] = None,
+        delta_e: Optional[float] = None,
+        delta_d: Optional[float] = None,
+        eta: Optional[float] = None,
+        max_key_nodes: Optional[int] = None,
+        target_clusters: Optional[int] = None,
+        feature_index: int = 0,
+        threshold_profile: Optional[str] = None,
+    ):
+        self.adj = np.asarray(graph_adj, dtype=np.float64)
+        self.theta = theta
+        self.lambda_value = lambda_value
+        self.maintenance_interval = max(1, int(maintenance_interval))
+        self.feature_index = feature_index
+        self.max_key_nodes = max_key_nodes
+        self.target_clusters = target_clusters
+
+        self.shortest_distances = compute_shortest_path_distances(self.adj)
+        finite_distances = self.shortest_distances[np.isfinite(self.shortest_distances) & (self.shortest_distances > 0)]
+        self.d0 = float(np.median(finite_distances)) if finite_distances.size > 0 else 1.0
+
+        self.delta_s = delta_s
+        self.delta_e = delta_e
+        self.delta_d = delta_d
+        self.eta = eta
+        if threshold_profile:
+            self.load_threshold_profile(threshold_profile)
 
         self.step_count = 0
-        self.last_full_update = 0
-        self.update_frequency = 20
+        self.key_nodes: List[int] = []
+        self.non_key_clusters: List[List[int]] = []
+        self.max_key_budget: Optional[int] = None
+        self.dtw_cache: Dict[Tuple[int, int], float] = {}
+        self.profile_states: Dict[Tuple[str, object], StableRangeState] = {}
+        self.last_scores = np.zeros(self.adj.shape[0], dtype=np.float64)
+        self.last_profiles: Dict[Tuple[str, object], EntityProfile] = {}
 
-        self.dtw_budget = dtw_budget
-        self.swap_budget = swap_budget
-        self.current_dtw_count = 0
-        self.current_swap_count = 0
-        self.drift_threshold = 0.1
-        self.last_performance = None
+    def load_threshold_profile(self, path: str) -> None:
+        profile = json.loads(Path(path).read_text(encoding="utf-8"))
+        self.delta_s = profile.get("delta_s", self.delta_s)
+        self.delta_e = profile.get("delta_e", self.delta_e)
+        self.delta_d = profile.get("delta_d", self.delta_d)
+        self.eta = profile.get("eta", self.eta)
 
-    def update_structure(self, data, performance_metric=None):
+    def _state_key(self, kind: str, members: Sequence[int]) -> Tuple[str, object]:
+        if kind == "key":
+            return kind, int(members[0])
+        return kind, tuple(sorted(int(member) for member in members))
+
+    def _update_stable_range(self, state_key: Tuple[str, object], smp: np.ndarray, eta: float) -> Tuple[np.ndarray, np.ndarray]:
+        if state_key not in self.profile_states:
+            low = smp - eta
+            high = smp + eta
+        else:
+            prev = self.profile_states[state_key]
+            low = np.minimum(prev.low, (prev.low + smp) / 2.0 - eta)
+            high = np.maximum(prev.high, (prev.high + smp) / 2.0 + eta)
+        self.profile_states[state_key] = StableRangeState(low=low, high=high)
+        return low, high
+
+    def _compute_entity_profile(self, kind: str, members: Sequence[int], data: np.ndarray) -> EntityProfile:
+        member_profiles = compute_member_slice_profiles(data, members, self.maintenance_interval, self.feature_index)
+        smp = compute_cluster_slice_mean(member_profiles)
+
+        eta = self.eta if self.eta is not None else infer_eta(member_profiles)
+        state_key = self._state_key(kind, members)
+        stable_low, stable_high = self._update_stable_range(state_key, smp, eta)
+
+        residual = compute_residual_error(member_profiles, smp) if kind == "cluster" else 0.0
+        out_of_range = bool(np.any((smp < stable_low) | (smp > stable_high)))
+        member_cd = {
+            int(member): compute_correlation_deviation(member_profiles[idx], stable_low, stable_high)
+            for idx, member in enumerate(members)
+        }
+
+        return EntityProfile(
+            kind=kind,
+            members=list(int(member) for member in members),
+            state_key=state_key,
+            smp=smp,
+            member_profiles=member_profiles,
+            stable_low=stable_low,
+            stable_high=stable_high,
+            residual=residual,
+            out_of_range=out_of_range,
+            member_cd=member_cd,
+        )
+
+    def _bootstrap_thresholds(self, data: np.ndarray, scores: np.ndarray) -> None:
+        if self.delta_s is None:
+            key_nodes, non_key_nodes, _, _ = select_dynamic_key_nodes(data, theta=self.theta)
+            if len(non_key_nodes) > 0:
+                self.delta_s = float(np.quantile(scores[non_key_nodes], 0.9))
+            else:
+                self.delta_s = float(np.quantile(scores, 0.5))
+
+        if self.delta_e is None or self.delta_d is None:
+            residuals: List[float] = []
+            deviations: List[float] = []
+            for cluster in self.non_key_clusters:
+                profile = self._compute_entity_profile("cluster", cluster, data)
+                residuals.append(profile.residual)
+                deviations.extend(profile.member_cd.values())
+
+            if self.delta_e is None:
+                self.delta_e = float(np.quantile(residuals, 0.9)) if residuals else 0.0
+            if self.delta_d is None:
+                self.delta_d = float(np.quantile(deviations, 0.9)) if deviations else infer_eta(data[..., self.feature_index])
+
+    def _build_initial_structure(self, data: np.ndarray) -> None:
+        self.dtw_cache = build_one_hop_dtw_cache(data, self.adj, self.feature_index)
+        scores, _, _ = compute_importance_scores(data, feature_index=self.feature_index)
+        self.last_scores = scores
+
+        key_nodes = select_top_theta(scores, self.theta, self.max_key_nodes)
+        self.max_key_budget = len(key_nodes) if self.max_key_nodes is None else int(self.max_key_nodes)
+        self.key_nodes = sorted(int(node) for node in key_nodes.tolist())
+
+        non_key_nodes = [node for node in range(self.adj.shape[0]) if node not in set(self.key_nodes)]
+        self.non_key_clusters = topology_constrained_ward(
+            non_key_nodes,
+            self.adj,
+            data,
+            shortest_distances=self.shortest_distances,
+            lambda_value=self.lambda_value,
+            dtw_cache=self.dtw_cache,
+            target_clusters=self.target_clusters,
+            feature_index=self.feature_index,
+        )
+
+        self._bootstrap_thresholds(data, scores)
+        self._update_profiles(data)
+
+    def _update_profiles(self, data: np.ndarray) -> Dict[Tuple[str, object], EntityProfile]:
+        current_profiles: Dict[Tuple[str, object], EntityProfile] = {}
+        active_keys: Set[Tuple[str, object]] = set()
+
+        for node in self.key_nodes:
+            profile = self._compute_entity_profile("key", [node], data)
+            current_profiles[profile.state_key] = profile
+            active_keys.add(profile.state_key)
+
+        for cluster in self.non_key_clusters:
+            if not cluster:
+                continue
+            profile = self._compute_entity_profile("cluster", cluster, data)
+            current_profiles[profile.state_key] = profile
+            active_keys.add(profile.state_key)
+
+        self.profile_states = {key: state for key, state in self.profile_states.items() if key in active_keys}
+        self.last_profiles = current_profiles
+        return current_profiles
+
+    def _sani_neighbors(
+        self,
+        state_key: Tuple[str, object],
+        profiles: Dict[Tuple[str, object], EntityProfile],
+        entity_labels: List[Tuple[str, object, List[int]]],
+        condensed_adj: np.ndarray,
+    ) -> List[Tuple[Tuple[str, object], float, float]]:
+        if self.delta_d is None or state_key not in profiles:
+            return []
+
+        label_to_idx = {(kind, identity): idx for idx, (kind, identity, _) in enumerate(entity_labels)}
+        idx = label_to_idx.get(state_key)
+        if idx is None:
+            return []
+
+        target = profiles[state_key]
+        neighbors: List[Tuple[Tuple[str, object], float, float]] = []
+        closeness_threshold = 1.0 / (self.delta_d + 1e-5)
+        for neighbor_idx, edge_weight in enumerate(condensed_adj[idx]):
+            if neighbor_idx == idx or edge_weight <= 0.0:
+                continue
+
+            kind, identity, _ = entity_labels[neighbor_idx]
+            neighbor_key = (kind, identity)
+            if neighbor_key not in profiles:
+                continue
+
+            neighbor_profile = profiles[neighbor_key]
+            cd = compute_correlation_deviation(neighbor_profile.smp, target.stable_low, target.stable_high)
+            if cd > self.delta_d:
+                continue
+
+            closeness, _ = compute_correlation_closeness(target.smp, neighbor_profile.smp, 2 * max(1, len(target.smp)))
+            if closeness >= closeness_threshold:
+                neighbors.append((neighbor_key, cd, closeness))
+        return neighbors
+
+    def _affected_entities(
+        self,
+        scores: np.ndarray,
+        profiles: Dict[Tuple[str, object], EntityProfile],
+        entity_labels: List[Tuple[str, object, List[int]]],
+        condensed_adj: np.ndarray,
+    ) -> Tuple[Set[int], Set[int], Set[int], Set[int]]:
+        demoted_keys: Set[int] = set()
+        promoted_vertices: Set[int] = set()
+        local_vertices: Set[int] = set()
+        directly_affected_clusters: Set[int] = set()
+
+        key_set = set(self.key_nodes)
+        min_key_score = min((scores[node] for node in key_set), default=-np.inf)
+
+        for cluster_index, cluster in enumerate(self.non_key_clusters):
+            profile_key = self._state_key("cluster", cluster)
+            profile = profiles.get(profile_key)
+            if profile is None:
+                continue
+
+            violates_cohesion = self.delta_e is not None and profile.residual > self.delta_e
+            incompatible_vertices = [
+                vertex
+                for vertex, deviation in profile.member_cd.items()
+                if self.delta_d is not None and deviation > self.delta_d
+            ]
+
+            if violates_cohesion or profile.out_of_range or incompatible_vertices:
+                directly_affected_clusters.add(cluster_index)
+                local_vertices.update(cluster)
+                for neighbor_key, _, _ in self._sani_neighbors(profile_key, profiles, entity_labels, condensed_adj):
+                    neighbor_profile = profiles.get(neighbor_key)
+                    if neighbor_profile is not None:
+                        local_vertices.update(neighbor_profile.members)
+
+            for vertex in incompatible_vertices:
+                if (len(key_set) < (self.max_key_budget or len(key_set) + 1)) or scores[vertex] > min_key_score:
+                    if len(key_set) >= (self.max_key_budget or len(key_set) + 1) and key_set:
+                        victim = min(key_set, key=lambda node: scores[node])
+                        if scores[vertex] > scores[victim]:
+                            key_set.discard(victim)
+                            demoted_keys.add(victim)
+                            local_vertices.add(victim)
+                    key_set.add(vertex)
+                    promoted_vertices.add(vertex)
+                    min_key_score = min((scores[node] for node in key_set), default=-np.inf)
+
+        for node in self.key_nodes:
+            profile_key = self._state_key("key", [node])
+            profile = profiles.get(profile_key)
+            if profile is None:
+                continue
+
+            if self.delta_s is not None and scores[node] < self.delta_s and profile.out_of_range:
+                demoted_keys.add(node)
+                local_vertices.add(node)
+                for neighbor_key, _, _ in self._sani_neighbors(profile_key, profiles, entity_labels, condensed_adj):
+                    neighbor_profile = profiles.get(neighbor_key)
+                    if neighbor_profile is not None:
+                        local_vertices.update(neighbor_profile.members)
+
+        return demoted_keys, promoted_vertices, local_vertices, directly_affected_clusters
+
+    def _maintain_structure(self, data: np.ndarray) -> None:
+        self.dtw_cache = build_one_hop_dtw_cache(data, self.adj, self.feature_index)
+        scores, _, _ = compute_importance_scores(data, feature_index=self.feature_index)
+        self.last_scores = scores
+
+        profiles = self._update_profiles(data)
+        condensed_adj, entity_labels = build_condensed_adjacency(self.key_nodes, self.non_key_clusters, self.adj, return_entities=True)
+        assert entity_labels is not None
+
+        demoted_keys, promoted_vertices, local_vertices, affected_cluster_ids = self._affected_entities(
+            scores,
+            profiles,
+            entity_labels,
+            condensed_adj,
+        )
+
+        if not demoted_keys and not promoted_vertices and not local_vertices:
+            return
+
+        updated_key_nodes = set(self.key_nodes)
+        updated_key_nodes -= demoted_keys
+        updated_key_nodes |= promoted_vertices
+        updated_key_nodes = {int(node) for node in updated_key_nodes}
+
+        local_vertices -= updated_key_nodes
+        unaffected_clusters = [
+            [node for node in cluster if node not in updated_key_nodes]
+            for idx, cluster in enumerate(self.non_key_clusters)
+            if idx not in affected_cluster_ids and not any(node in local_vertices for node in cluster)
+        ]
+        unaffected_clusters = [cluster for cluster in unaffected_clusters if cluster]
+
+        for node in demoted_keys:
+            local_vertices.add(int(node))
+
+        recluster_pool = sorted(int(node) for node in local_vertices if node not in updated_key_nodes)
+        local_clusters = topology_constrained_ward(
+            recluster_pool,
+            self.adj,
+            data,
+            shortest_distances=self.shortest_distances,
+            lambda_value=self.lambda_value,
+            dtw_cache=self.dtw_cache,
+            target_clusters=min(
+                estimate_target_cluster_count(len(recluster_pool)),
+                len(recluster_pool),
+            )
+            if recluster_pool
+            else 0,
+            feature_index=self.feature_index,
+        )
+
+        covered_non_key_nodes = {node for cluster in unaffected_clusters for node in cluster}
+        covered_non_key_nodes.update(node for cluster in local_clusters for node in cluster)
+        remaining_non_key_nodes = [
+            node
+            for node in range(self.adj.shape[0])
+            if node not in updated_key_nodes and node not in covered_non_key_nodes
+        ]
+        local_clusters.extend([[node] for node in remaining_non_key_nodes])
+
+        self.key_nodes = sorted(updated_key_nodes)
+        self.non_key_clusters = [sorted(cluster) for cluster in unaffected_clusters + local_clusters if cluster]
+        self._update_profiles(data)
+
+    def update_structure(self, data: np.ndarray, performance_metric=None) -> Dict[str, object]:
+        del performance_metric
 
         self.step_count += 1
-        T, N, F = data.shape
-
-        if not self._should_update_structure(performance_metric):
-            return self._export_structure_info()
-
-        self.current_dtw_count = 0
-        self.current_swap_count = 0
-
-        self._update_summaries(data)
-
-        self._update_key_nodes(data, performance_metric)
-
-        self._perform_local_operations(data)
-
-        if self.step_count % self.update_frequency == 0:
-            self._perform_merge_split_operations(data)
+        if not self.key_nodes and not self.non_key_clusters:
+            self._build_initial_structure(data)
+        elif self.step_count % self.maintenance_interval == 0:
+            self._maintain_structure(data)
 
         return self._export_structure_info()
 
-    def _should_update_structure(self, performance_metric):
-
-        if self.fast_mode:
-            if self.step_count % (self.update_frequency * 2) == 0:
-                return True
-            if self.step_count < 20:
-                return True
-            return False
-
-        if self.step_count % self.update_frequency == 0:
-            return True
-
-        if performance_metric is not None and self.last_performance is not None:
-            drift = abs(performance_metric - self.last_performance) / self.last_performance
-            if drift > self.drift_threshold * 2:
-                return True
-
-        if self.step_count < 100:
-            return True
-
-        return False
-
-    def _check_dtw_budget(self):
-
-        return self.current_dtw_count < self.dtw_budget
-
-    def _check_swap_budget(self):
-
-        return self.current_swap_count < self.swap_budget
-
-    def _record_dtw_usage(self, count=1):
-
-        self.current_dtw_count += count
-
-    def _record_swap_usage(self, count=1):
-
-        self.current_swap_count += count
-
-    def _update_summaries(self, data):
-
-        T, N, F = data.shape
-
-        for u in range(N):
-            ts = data[:, u, 0]
-            is_key = u in self.quota_selector.K
-            self.hc_index.update_summary(u, ts, timestamp=self.step_count, is_key=is_key)
-
-    def _update_key_nodes(self, data, performance_metric):
-
-        if performance_metric is not None:
-            self.quota_selector.update_performance(performance_metric)
-
-        self.quota_selector.batch_update(data)
-
-    def _perform_local_operations(self, data):
-
-        operation_list = []
-
-        for u in range(data.shape[1]):
-            if u not in self.quota_selector.K:
-                if self.local_ops._is_outlier(u, data):
-                    operation_list.append(('reassign', u))
-
-        if operation_list:
-            self.local_ops.batch_operations(data, operation_list)
-
-    def _perform_merge_split_operations(self, data):
-
-        results = self.super_manager.batch_merge_split(self.step_count, data)
-        return results
-
-    def _export_structure_info(self):
-
-        key_nodes = list(self.quota_selector.K)
-
-        total_nodes = int(self.hc_index.adj.shape[0]) if hasattr(self.hc_index, 'adj') else len(self.hc_index.node_to_super)
-        non_key_nodes = list(self.quota_selector.get_non_key_nodes(total_nodes))
-
-        cluster_indices_list = []
-        for super_id, summary in self.hc_index.super_summaries.items():
-            if len(summary.members) > 0:
-                cluster_indices_list.append(list(summary.members))
-
+    def _export_structure_info(self) -> Dict[str, object]:
+        non_key_nodes = sorted(node for cluster in self.non_key_clusters for node in cluster)
+        condensed_adj, _ = build_condensed_adjacency(self.key_nodes, self.non_key_clusters, self.adj, return_entities=False)
         return {
-            'key_nodes': key_nodes,
-            'non_key_nodes': non_key_nodes,
-            'cluster_indices_list': cluster_indices_list,
-            'super_nodes': list(self.hc_index.super_summaries.keys()),
-            'node_to_super': self.hc_index.node_to_super.copy()
+            "key_nodes": list(self.key_nodes),
+            "non_key_nodes": non_key_nodes,
+            "cluster_indices_list": [list(cluster) for cluster in self.non_key_clusters],
+            "super_nodes": [list(cluster) for cluster in self.non_key_clusters],
+            "condensed_adj": condensed_adj,
+            "thresholds": {
+                "delta_s": self.delta_s,
+                "delta_e": self.delta_e,
+                "delta_d": self.delta_d,
+                "eta": self.eta,
+            },
         }
 
-    def get_comprehensive_statistics(self):
-
+    def get_comprehensive_statistics(self) -> Dict[str, object]:
         return {
-            'step_count': self.step_count,
-            'quota_stats': self.quota_selector.get_statistics(),
-            'hc_stats': self.hc_index.get_statistics(),
-            'local_ops_stats': self.local_ops.get_statistics(),
-            'super_manager_stats': self.super_manager.get_statistics()
+            "step_count": self.step_count,
+            "theta": self.theta,
+            "lambda_value": self.lambda_value,
+            "maintenance_interval": self.maintenance_interval,
+            "delta_s": self.delta_s,
+            "delta_e": self.delta_e,
+            "delta_d": self.delta_d,
+            "num_key_nodes": len(self.key_nodes),
+            "num_non_key_clusters": len(self.non_key_clusters),
         }
+
+
+# Backward-compatible alias kept for the rest of the repository.
+OptimizedStructureManager = PaperAlignedStructureManager

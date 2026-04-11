@@ -1,22 +1,34 @@
 from typing import Any, Dict
 
+
 def get_bqh_config() -> Dict[str, Any]:
+    """
+    Legacy helper name preserved for compatibility.
+
+    The returned defaults are paper-aligned CRSTNet parameters rather than the
+    earlier BQH placeholder settings.
+    """
 
     return {
-        'keynode': {
-            'hysteresis_alpha': 0.1,
-            'k_min_ratio': 0.05,
-            'k_max_ratio': 0.3,
-            'budget_ratio': 0.1
-        },
-        'clustering': {
-            'merge_threshold': 0.8,
-            'split_threshold': 0.5,
-            'cooldown': 20
-        }
+        "theta": 0.2,
+        "lambda_value": 0.5,
+        "gamma": 0.5,
+        "maintenance_interval": 5,
+        "k_min": 2,
+        "k_max": 6,
+        "threshold_quantile": 0.9,
+        "eta_scale": 0.1,
     }
 
-def validate_bqh_config(config: Dict[str, Any]) -> bool:
 
-    required_keys = ['keynode', 'clustering']
+def validate_bqh_config(config: Dict[str, Any]) -> bool:
+    required_keys = [
+        "theta",
+        "lambda_value",
+        "gamma",
+        "maintenance_interval",
+        "k_min",
+        "k_max",
+        "threshold_quantile",
+    ]
     return all(key in config for key in required_keys)
