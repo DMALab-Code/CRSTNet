@@ -1,5 +1,5 @@
 # CRSTNet
-This is an implementation of "CRSTNet: Dynamic Cluster Routing for Adaptive Spatio-Temporal Traffic Prediction".
+This is an implementation of "CRSTNet: Efficient Spatio-Temporal Forecasting via Adaptive Cluster Routing".
 
 # Table of Contents
 
