@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.Zone.Identifier
+
+.venv/
+venv/
+env/
+
+.DS_Store
+*.log
+
+checkpoints/
+baselines/CRSTNet/cache/*.pkl
+baselines/CRSTNet/thresholds/*.json
