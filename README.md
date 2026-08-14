@@ -68,7 +68,7 @@ We evaluate CRSTNet on Weather2K, a meteorological sensor network containing 1,8
 | Method | Air Temperature MAE/RMSE | Relative Humidity MAE/RMSE | Wind Speed MAE/RMSE | Air Pressure MAE/RMSE | Avg. MAE/RMSE | Training (s/epoch) |
 |:--|--:|--:|--:|--:|--:|--:|
 | CDPNet [2] | **1.39 / 1.86** | **7.26 / 9.75** | **0.87 / 1.23** | **1.43 / 1.98** | **2.74 / 3.70** | 153.71 |
-| **ours** | 1.43 / 1.90 | 7.40 / 9.90 | 0.88 / 1.26 | 1.54 / 2.11 | **2.81 / 3.79** | **19.31** |
+| **ours** | 1.43 / 1.90 | 7.40 / 9.90 | 0.88 / 1.26 | 1.54 / 2.11 | 2.81 / 3.79 | **19.31** |
 
 Lower values indicate better performance. `Avg.` is the arithmetic mean over air temperature, relative humidity, wind speed, and air pressure. Training time was measured on the same hardware and excludes validation and testing. The
 CDPNet training time was obtained from our same-hardware rerun because it is not reported in the original paper.
